@@ -1,0 +1,12 @@
+node_modules/
+coverage/
+test-results/
+playwright-report/
+.cache/
+.env*
+*.log
+*.local.*
+*backup*.json
+작업현황.md
+작업파일/
+참고자료/

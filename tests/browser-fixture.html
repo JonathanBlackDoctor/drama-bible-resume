@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>성경 이어듣기 · 개발용 미리보기</title>
+<style>body{margin:0;background:#eff2e9;color:#264536;font:15px/1.7 system-ui}main{max-width:650px;margin:40px auto;padding:25px}h1{font-size:25px;letter-spacing:-.04em}.tag{font-size:11px;letter-spacing:.1em}button{padding:12px;margin:5px;border-radius:10px;border:1px solid #bacdbb;background:white;color:#234b3b}#movie_player{background:#254d40;border-radius:20px;color:white;padding:24px;aspect-ratio:16/9;display:flex;flex-direction:column;justify-content:center;align-items:center}video{width:0;height:0}.note{color:#59715e;font-size:13px}.ad-showing{background:#795831!important}</style>
+<main><p class="tag">DRAMA BIBLE · DEVELOPMENT PREVIEW</p><h1>어제 듣던 말씀,<br>오늘도 이어서.</h1><p class="note">개발용 모의 화면입니다. 실제 유튜브·음원은 재생하지 않습니다.<br>오른쪽 아래 패널에서 이어 듣기와 기록을 확인하세요.</p><div id="movie_player"><video class="html5-main-video"></video><strong>사도행전 · 모의 플레이어</strong><p id="clock">0:00</p></div><p><button id="ad">광고 상태 전환</button><button id="back">20초 뒤로</button><button id="reset">미리보기 기록 초기화</button></p></main>
+<script>
+  window.GM={getValue:async(k,f=null)=>{const v=localStorage.getItem(k);return v===null?f:JSON.parse(v)},setValue:async(k,v)=>localStorage.setItem(k,JSON.stringify(v)),listValues:async()=>Object.keys(localStorage).filter(k=>k.startsWith('dbr:'))};
+  window.unsafeWindow=window;
+  const p=document.getElementById('movie_player'),v=p.querySelector('video'); let pos=0,paused=true;
+  p.getVideoData=()=>({video_id:'jVO5lOOS37w',title:'사도행전 · 전체 통독'});
+  p.getPlayerResponse=()=>({videoDetails:{videoId:'jVO5lOOS37w',lengthSeconds:'900'}});
+  Object.defineProperties(v,{duration:{get:()=>900},currentTime:{get:()=>pos,set:n=>{pos=n;queueMicrotask(()=>v.dispatchEvent(new Event('seeked')))}},paused:{get:()=>paused},ended:{get:()=>pos>=900},readyState:{get:()=>4},seeking:{get:()=>false},playbackRate:{get:()=>1}});
+  v.play=()=>{paused=false;v.dispatchEvent(new Event('play'));return Promise.resolve()};v.pause=()=>{paused=true;v.dispatchEvent(new Event('pause'))};
+  setInterval(()=>{if(!paused){pos=Math.min(900,pos+1);v.dispatchEvent(new Event(pos>=900?'ended':'timeupdate'))}document.getElementById('clock').textContent=Math.floor(pos/60)+':'+String(Math.floor(pos%60)).padStart(2,'0')},1000);
+  document.getElementById('ad').onclick=()=>p.classList.toggle('ad-showing');
+  document.getElementById('back').onclick=()=>{v.dispatchEvent(new Event('seeking'));v.currentTime=Math.max(0,pos-20)};
+  document.getElementById('reset').onclick=()=>{for(const k of Object.keys(localStorage))if(k.startsWith('dbr:'))localStorage.removeItem(k);location.reload()};
+  window.module={exports:{}};
+</script><script src="/drama-bible-resume.user.js"></script><script>module.exports.startApp({window,document,gm:GM,getUrl:()=> 'https://m.youtube.com'+location.pathname+location.search});delete window.module;</script></html>
