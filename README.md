@@ -7,7 +7,7 @@ Android Firefox에서 성경을 듣다가 멈추고, 다음 날 **이어 듣기*
 ## 휴대폰에서 처음 설치하기
 
 1. **Android Firefox**에서 [Violentmonkey 설치 페이지](https://addons.mozilla.org/ko/android/addon/violentmonkey/)를 열고 확장을 설치합니다.
-2. 같은 Firefox에서 **[드라마바이블 스크립트 설치](https://raw.githubusercontent.com/JonathanBlackDoctor/drama-bible-resume/main/drama-bible-resume.user.js)**를 누릅니다. Violentmonkey의 설치 화면에서 이름과 유튜브 접근 범위를 확인하고 설치합니다.
+2. 같은 Firefox에서 [드라마바이블 스크립트 설치](https://raw.githubusercontent.com/JonathanBlackDoctor/drama-bible-resume/main/drama-bible-resume.user.js)를 누릅니다. Violentmonkey의 설치 화면에서 이름과 유튜브 접근 범위를 확인하고 설치합니다.
 3. **처음에는 현재 듣던 위치가 포함된 유튜브 링크**를 Firefox에서 엽니다. 링크의 `t=` 시작 시간을 최초 진도로 사용합니다. 위치가 없는 링크라면 **기록·영상 → 현재 위치 직접 수정**에서 시작할 분:초를 입력합니다.
 4. 유튜브 오른쪽 아래의 **이어 듣기**를 누릅니다. 이미 듣는 중이면 같은 버튼이 **일시정지**로 바뀝니다.
 
