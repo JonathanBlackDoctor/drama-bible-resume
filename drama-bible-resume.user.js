@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         드라마바이블 이어듣기
 // @namespace    https://github.com/JonathanBlackDoctor/drama-bible-resume
-// @version      1.0.1
+// @version      1.1.0
 // @description  마지막 위치부터 성경을 듣고, 날짜별 청취 기록을 내 기기에 보관합니다.
 // @author       JonathanBlackDoctor
 // @license      MIT
@@ -28,6 +28,7 @@
   const MAX_BACKUP_BYTES = 5 * 1024 * 1024;
   const SEOUL = 9 * 3600 * 1000;
   const DAY = 24 * 3600 * 1000;
+  const CONFIRM_SECONDS = 30;
   const copy = (value) => JSON.parse(JSON.stringify(value));
 
   function parseTime(value) {
@@ -86,6 +87,31 @@
     }
   }
 
+  class ResumeGuard {
+    constructor() { this.pending = null; }
+    reset() { this.pending = null; }
+    seek(from, to, at, id, completed = false) {
+      const protectedPoint = this.pending;
+      this.pending = {
+        id: protectedPoint?.id || id, fromPosition: protectedPoint?.fromPosition ?? from,
+        fromCompleted: protectedPoint?.fromCompleted ?? completed,
+        position: to, listenedSeconds: 0, startedAt: at
+      };
+      return { id, at, fromPosition: from, toPosition: to, kind: 'seek' };
+    }
+    observe(seconds, position, canConfirm = true) {
+      if (!this.pending) return;
+      this.pending.position = position;
+      this.pending.listenedSeconds = Math.min(CONFIRM_SECONDS, this.pending.listenedSeconds + seconds);
+      if (canConfirm && this.pending.listenedSeconds >= CONFIRM_SECONDS) this.pending = null;
+    }
+    snapshot(position, duration, completed) {
+      return this.pending
+        ? { position: this.pending.fromPosition, duration, completed: this.pending.fromCompleted, pending: copy(this.pending) }
+        : { position, duration, completed, pending: null };
+    }
+  }
+
   function validateBackup(raw) {
     const bad = () => { throw new Error('백업 형식이 올바르지 않습니다. 기존 기록은 변경하지 않았습니다.'); };
     const finite = (n, max = 1e12) => typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= max;
@@ -101,7 +127,13 @@
     const progress = raw.progress.map((p) => {
       if (!p || !ids.has(p.videoId) || seenProgress.has(p.videoId) || !finite(p.position) || !finite(p.duration) || !finite(p.updatedAt, 9e15) || typeof p.completed !== 'boolean' || (p.duration > 0 && p.position > p.duration + 2)) bad();
       seenProgress.add(p.videoId);
-      return { videoId: p.videoId, position: p.position, duration: p.duration, updatedAt: p.updatedAt, completed: p.completed };
+      let pending = null;
+      if (p.pending != null) {
+        const q = p.pending;
+        if (!TOKEN.test(q.id) || !finite(q.fromPosition) || !finite(q.position) || !finite(q.listenedSeconds, CONFIRM_SECONDS) || !finite(q.startedAt, 9e15) || typeof q.fromCompleted !== 'boolean' || q.fromPosition !== p.position || (p.duration > 0 && q.position > p.duration + 2)) bad();
+        pending = { id: q.id, fromPosition: q.fromPosition, fromCompleted: q.fromCompleted, position: q.position, listenedSeconds: q.listenedSeconds, startedAt: q.startedAt };
+      }
+      return { videoId: p.videoId, position: p.position, duration: p.duration, updatedAt: p.updatedAt, completed: p.completed, pending };
     });
     const seenSessions = new Set();
     const sessions = raw.sessions.map((s) => {
@@ -111,7 +143,14 @@
       seenSessions.add(`${s.id}:${s.date}`);
       return { id: s.id, videoId: s.videoId, date: s.date, startPosition: s.startPosition, endPosition: s.endPosition, listenedSeconds: s.listenedSeconds, updatedAt: s.updatedAt, startedAt: s.startedAt };
     });
-    return { videos, progress, sessions };
+    if (raw.checkpoints !== undefined && (!Array.isArray(raw.checkpoints) || raw.checkpoints.length > 20000)) bad();
+    const seenPoints = new Set();
+    const checkpoints = (raw.checkpoints || []).map((p) => {
+      if (!p || !TOKEN.test(p.id) || !ids.has(p.videoId) || !finite(p.at, 9e15) || !finite(p.fromPosition) || !finite(p.toPosition) || !['seek', 'edit', 'restore'].includes(p.kind) || seenPoints.has(p.id)) bad();
+      seenPoints.add(p.id);
+      return { id: p.id, videoId: p.videoId, at: p.at, fromPosition: p.fromPosition, toPosition: p.toPosition, kind: p.kind };
+    });
+    return { videos, progress, sessions, checkpoints };
   }
 
   class Store {
@@ -153,11 +192,31 @@
       await this.set(`position:${id}:${token}`, { videoId: id, ...progress, updatedAt: this.now() });
       return true;
     }
+    async checkpoint(videoId, fromPosition, toPosition, kind = 'seek') {
+      const point = { id: this.uuid(), videoId, at: this.now(), fromPosition, toPosition, kind };
+      await this.set(`checkpoint:${videoId}:${point.id}`, point);
+      return point;
+    }
+    async recoverable(videoId) {
+      const checkpoints = (await this.entries(`checkpoint:${videoId}:`)).filter(Boolean);
+      const sessions = (await this.entries('session:')).filter((s) => s?.videoId === videoId);
+      const owner = await this.get(`owner:${videoId}`);
+      const archived = (await this.entries(`position:${videoId}:`)).filter((p) => p?.updatedAt > 0);
+      const points = [
+        ...checkpoints.map((p) => ({ at: p.at, position: p.fromPosition, label: p.kind === 'seek' ? '구간 이동 전' : p.kind === 'edit' ? '위치 수정 전' : '복원 전' })),
+        ...sessions.map((s) => ({ at: s.updatedAt, position: s.endPosition, label: '재생 기록' })),
+        ...archived.map((p) => ({ at: p.updatedAt, position: p.position, label: '저장된 진도' })),
+        ...(owner?.seed?.updatedAt > 0 ? [{ at: owner.seed.updatedAt, position: owner.seed.position, label: '재생 시작 전' }] : [])
+      ].sort((a, b) => b.at - a.at);
+      const seen = new Set();
+      return points.filter((p) => { const key = `${Math.floor(p.position)}:${Math.floor(p.at / 1000)}`; if (seen.has(key)) return false; seen.add(key); return true; }).slice(0, 40);
+    }
     async exportBackup() {
       const videos = await this.videos();
       const progress = await Promise.all(videos.map((video) => this.progress(video.id)));
       const sessions = (await this.entries('session:')).filter(Boolean);
-      return { format: 'drama-bible-resume', version: 1, exportedAt: new Date(this.now()).toISOString(), videos, progress, sessions };
+      const checkpoints = (await this.entries('checkpoint:')).filter(Boolean);
+      return { format: 'drama-bible-resume', version: 1, exportedAt: new Date(this.now()).toISOString(), videos, progress, sessions, checkpoints };
     }
     async importBackup(raw) {
       const backup = validateBackup(raw); // Validate the entire file BEFORE the first write.
@@ -175,6 +234,10 @@
         const key = `session:${session.id}:${session.date}`;
         const existing = await this.get(key);
         if (!existing || existing.updatedAt < session.updatedAt) await this.set(key, session);
+      }
+      for (const point of backup.checkpoints) {
+        const key = `checkpoint:${point.videoId}:${point.id}`;
+        if (!await this.get(key)) await this.set(key, point);
       }
       return backup;
     }
@@ -207,6 +270,8 @@
     *{box-sizing:border-box}button,input{font:inherit}button{cursor:pointer;min-height:46px;border:1px solid #d9e4dd;border-radius:13px;padding:9px 13px;background:#fff;color:#233b36}button:focus-visible,input:focus-visible,summary:focus-visible{outline:3px solid #d58c37;outline-offset:2px}button:hover{background:#edf4ee}button:disabled{opacity:.5;cursor:wait}
     .shell{position:fixed;z-index:2147483646;right:max(12px,env(safe-area-inset-right));bottom:max(12px,env(safe-area-inset-bottom));width:min(410px,calc(100vw - 24px));background:#fffdf6;border:1px solid #dce5d9;border-radius:23px;box-shadow:0 8px 36px #102c2933;overflow:hidden}
     .head{display:flex;align-items:center;gap:10px;padding:14px 17px 4px}.brand{font-size:11px;letter-spacing:.12em;font-weight:700;color:#60796c}.close{margin-left:auto;border:0;background:none;padding:0;min-height:32px;width:32px}.body{padding:0 17px 16px}h2{font-size:18px;letter-spacing:-.03em;margin:2px 0 5px}p{margin:5px 0}.muted{color:#64776d;font-size:12px}.progress{height:5px;background:#e5ecdf;border-radius:6px;margin:12px 0}.bar{height:100%;background:#57866b;border-radius:6px;width:0}.row{display:flex;gap:8px;align-items:center}.row>*{min-width:0}.primary{flex:1;background:#254f41;color:white;border-color:#254f41;font-weight:700;font-size:16px}.primary:hover{background:#193e32}.secondary{background:#f1f4e9}.status{min-height:19px;margin-top:8px;font-size:12px;color:#596f61}.status.error{color:#a13c25}.drawer{border-top:1px solid #dce5d9;padding:13px 17px;max-height:52vh;overflow-y:auto;overscroll-behavior:contain}h3{font-size:14px;margin:0 0 8px}label{display:block;font-size:12px;color:#50695c;margin:7px 0 3px}input{min-height:46px;border:1px solid #ccd8cb;border-radius:10px;width:100%;padding:10px;background:white;color:#233b36}form{margin:10px 0 16px}.video-row,.history-row{padding:10px 0;border-bottom:1px solid #e6ebdf}.video-row button{width:100%;text-align:left}.history-row strong{display:block;font-size:13px}.tools{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}.tools button{flex:1;font-size:12px}summary{cursor:pointer;padding:8px 0}.chip{position:fixed;right:12px;bottom:max(12px,env(safe-area-inset-bottom));z-index:2147483646;border-radius:30px;box-shadow:0 3px 15px #102c2933;background:#fffdf6;font-weight:700}.empty{padding:15px 0;color:#687969;font-size:13px}.small{font-size:12px}.count{color:#69816c;font-size:12px;margin-left:7px}[hidden]{display:none!important}
+    .safety{background:#fff0cf;border:1px solid #e5ca8f;border-radius:12px;padding:9px;margin-top:9px;font-size:12px}.safety button{font-size:12px;flex:1}.safety p{margin:0 0 7px}.recovery-list{max-height:190px;overflow:auto;margin-bottom:16px}.recovery-list button{width:100%;text-align:left;margin:3px 0;font-size:12px}.history-row button{font-size:12px}
+    .shell{max-height:calc(100dvh - 24px);display:flex;flex-direction:column}.head,.body{flex-shrink:0}.drawer{min-height:0;flex:1 1 auto}
     @media(prefers-reduced-motion:no-preference){.bar{transition:width .3s}}@media(max-height:500px){.drawer{max-height:35vh}.shell{bottom:5px}}
   `;
 
@@ -227,15 +292,25 @@
     let lastSave = 0, lastUi = 0, status = '기록은 이 기기에만 보관됩니다.', restoreTarget = null;
     let pendingCredits = [], detailsTask = Promise.resolve(), reconciling = null;
     const meter = new Meter();
+    const guard = new ResumeGuard();
+    const persistedMoves = new Set();
+    let lastObserved = null, seekOrigin = null;
     const host = doc.createElement('aside'); host.id = 'dbr-root'; doc.documentElement.append(host);
     const root = host.attachShadow({ mode: 'open' });
     root.innerHTML = `<style>${CSS}</style><button class="chip" type="button">📖 성경 듣기</button><section class="shell" aria-label="드라마바이블 이어듣기"><div class="head"><span class="brand">DRAMA BIBLE · 이어듣기</span><button class="close" aria-label="패널 접기" type="button">×</button></div><div class="body"><h2 id="title"></h2><p class="muted" id="position"></p><div class="progress" role="progressbar" aria-label="영상 진도" aria-valuemin="0" aria-valuemax="100"><div class="bar"></div></div><div class="row"><button class="primary" type="button">▶ 이어 듣기</button><button class="secondary" type="button" aria-expanded="false">기록·영상</button></div><p class="status" role="status" aria-live="polite"></p></div><div class="drawer" hidden><h3>내 성경 영상</h3><div id="library"></div><form id="add"><label for="url">다른 성경 영상 추가</label><input id="url" type="url" placeholder="유튜브 영상 링크" required><label for="video-title">영상 이름 (선택)</label><input id="video-title" placeholder="예: 로마서 전체 통독" maxlength="200"><button type="submit" style="margin-top:8px;width:100%">＋ 영상 추가</button></form><details><summary>현재 위치 직접 수정</summary><form id="edit"><label for="time">시:분:초 또는 분:초</label><div class="row"><input id="time" placeholder="0:00" required><button type="submit">저장</button></div><p class="muted">선택한 영상의 다음 시작 위치를 바꿉니다.</p></form></details><div class="tools"><button id="export" type="button">백업 저장</button><button id="import" type="button">백업 가져오기</button><input id="file" type="file" accept=".json,application/json" hidden></div><p class="muted">가져오기는 기존 기록에 합칩니다. 백업에는 개인 청취 기록이 들어 있습니다.</p><h3 style="margin-top:18px">날짜별 청취 기록 <span class="count">서울 시간</span></h3><div id="history"></div><p class="muted">앞뒤로 이동한 구간은 청취 시간에 포함하지 않습니다. 백그라운드 저장은 Android 절전 설정에 따라 늦어질 수 있습니다.</p></div></section>`;
     const $ = (selector) => root.querySelector(selector);
+    const safety = doc.createElement('div'); safety.className = 'safety'; safety.hidden = true;
+    safety.innerHTML = '<p id="safety-note"></p><div class="row"><button id="undo-seek" type="button">이동 전으로 복구</button><button id="accept-seek" type="button">새 진도로 확정</button></div>';
+    $('.body').append(safety);
+    const recovery = doc.createElement('section');
+    recovery.innerHTML = '<h3>이전 진도 복구</h3><p class="muted">기록된 위치를 누르면 복구됩니다. 시간을 기억할 필요가 없습니다.</p><div id="recovery" class="recovery-list"></div>';
+    $('.drawer').prepend(recovery);
     const label = (value) => { status = value; $('.status').classList.remove('error'); $('.status').textContent = value; };
     const fail = (error) => { label(error?.message || '저장할 수 없습니다. 백업과 확장 권한을 확인해 주세요.'); $('.status').classList.add('error'); };
     const enqueue = (task) => { const result = queue.then(task); queue = result.catch(fail); return result; };
     const currentId = () => { try { return parseVideo(getUrl()).id; } catch { return null; } };
     const evidence = () => inspectPlayer(doc, page, currentId());
+    const selectedPending = () => currentId() === selected && guard.pending ? guard.pending : progress.pending;
 
     function render() {
       if (destroyed) return;
@@ -249,9 +324,22 @@
       $('.bar').style.width = `${percent}%`; $('.progress').setAttribute('aria-valuenow', String(Math.round(percent)));
       $('.primary').textContent = live.valid && currentId() === selected && !live.video.paused && active && !ownerLost ? 'Ⅱ 일시정지' : '▶ 이어 듣기';
       $('.status').textContent = status;
+      const pending = selectedPending();
+      safety.hidden = !pending;
+      if (pending) $('#safety-note').textContent = `기존 진도 ${formatTime(pending.fromPosition)} 보호 중 · 이동 후 실제 ${Math.floor(pending.listenedSeconds)}/${CONFIRM_SECONDS}초 청취. 새 위치 ${formatTime(pending.position)}`;
     }
 
     async function renderDetails() {
+      $('#recovery').replaceChildren();
+      const points = await store.recoverable(selected);
+      for (const point of points) {
+        const id = selected;
+        const button = doc.createElement('button'); button.type = 'button';
+        button.textContent = `${new Date(point.at).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })} · ${point.label} · ${formatTime(point.position)}로 복구`;
+        button.addEventListener('click', () => setPosition(id, point.position).catch(() => {}));
+        $('#recovery').append(button);
+      }
+      if (!points.length) { const empty = doc.createElement('p'); empty.className = 'empty'; empty.textContent = '듣던 위치와 구간 이동 전 위치가 자동으로 남습니다.'; $('#recovery').append(empty); }
       $('#library').replaceChildren();
       for (const video of videos) {
         const saved = await store.progress(video.id);
@@ -274,7 +362,9 @@
         const row = doc.createElement('div'); row.className = 'history-row';
         const title = doc.createElement('strong'); title.textContent = `${session.date} · ${videos.find((v) => v.id === session.videoId)?.title || '성경 영상'}`;
         const text = doc.createElement('p'); text.className = 'muted'; text.textContent = `${formatTime(session.startPosition)} → ${formatTime(session.endPosition)} · ${formatTime(session.listenedSeconds)} 청취`;
-        row.append(title, text); $('#history').append(row);
+        const restore = doc.createElement('button'); restore.type = 'button'; restore.textContent = '이 기록의 마지막 위치로 복구';
+        restore.addEventListener('click', () => setPosition(session.videoId, session.endPosition).catch(() => {}));
+        row.append(title, text, restore); $('#history').append(row);
       }
       if (!groups.size) { const empty = doc.createElement('p'); empty.className = 'empty'; empty.textContent = '듣기 시작하면 오늘의 기록이 쌓입니다.'; $('#history').append(empty); }
       $('#time').value = formatTime(progress.position);
@@ -295,21 +385,64 @@
       try { await starting; } finally { starting = null; }
     }
 
+    function recordJump(from, to) {
+      if (!restored || restoreTarget !== null || Math.abs(to - from.position) < 1) return;
+      const point = guard.seek(from.position, to, now(), uuid(), Boolean(progress.completed));
+      point.videoId = boundId;
+      const key = `checkpoint:${boundId}:${point.id}`;
+      // Append before saving a changed cursor; old recovery points are never overwritten.
+      enqueue(async () => { await store.set(key, point); persistedMoves.add(point.id); }).catch(() => {});
+      meter.reset(); lastSave = 0;
+      label(`이동 전 ${formatTime(guard.pending.fromPosition)} 보관 · 새 위치에서 ${CONFIRM_SECONDS}초 들으면 진도로 반영합니다.`);
+      if (!active || ownerLost) begin(boundId).then(() => flush(true)).catch(fail);
+      render();
+    }
+
+    function setPosition(id, target, kind = 'restore') {
+      const current = evidence();
+      if (currentId() === id && current.valid) current.video.pause();
+      return enqueue(async () => {
+        const saved = await store.progress(id);
+        if (!Number.isFinite(target) || target < 0 || (saved.duration && target > saved.duration)) throw new Error('영상 범위 안의 위치를 선택해 주세요.');
+        await store.checkpoint(id, saved.pending?.position ?? saved.position, target, kind);
+        const token = await store.claim(id);
+        await store.savePosition(id, token, { position: target, duration: saved.duration, completed: false, pending: null });
+        if (currentId() === id) {
+          active = null; ownerLost = false; meter.reset(); pendingCredits = []; guard.reset(); seekOrigin = null;
+          if (current.valid) { restored = true; restoreTarget = Math.abs(current.video.currentTime - target) > 0.5 ? target : null; if (restoreTarget !== null) current.video.currentTime = target; lastObserved = { id, position: target, at: now() }; }
+        }
+        selected = id; progress = await store.progress(id);
+        label(kind === 'restore' ? `${formatTime(target)}로 진도를 복구했습니다. 이어 듣기를 눌러 주세요.` : '시작 위치를 저장했습니다.');
+        render(); await renderDetails();
+      });
+    }
+
     function sample() {
       const current = evidence();
+      if (current.valid && restored && restoreTarget === null && !current.video.seeking && !seekOrigin) {
+        if (lastObserved?.id === boundId) {
+          const elapsed = Math.max(0, (now() - lastObserved.at) / 1000);
+          const advance = current.position - lastObserved.position;
+          if (advance < -1 || advance > Math.max(5, elapsed * (current.video.playbackRate || 1) + 2)) recordJump(lastObserved, current.position);
+        }
+        lastObserved = { id: boundId, position: current.position, at: now() };
+      }
       if (!active || ownerLost || currentId() !== active.id) { meter.reset(); return current; }
-      const seconds = meter.observe({ now: now(), valid: current.valid, seeking: Boolean(current.video?.seeking), position: current.position ?? 0, rate: current.video?.playbackRate || 1, playing: current.valid && !current.video.paused && !current.video.ended && current.video.readyState >= 2 });
+      const seconds = meter.observe({ now: now(), valid: current.valid, seeking: Boolean(current.video?.seeking || seekOrigin || restoreTarget !== null), position: current.position ?? 0, rate: current.video?.playbackRate || 1, playing: current.valid && !current.video.paused && !current.video.ended && current.video.readyState >= 2 });
       if (seconds > 0) pendingCredits.push({ at: now(), seconds, position: current.position, rate: current.video.playbackRate || 1 });
+      const wasPending = Boolean(guard.pending);
+      if (current.valid) guard.observe(seconds, current.position, !guard.pending || persistedMoves.has(guard.pending.id));
+      if (wasPending && !guard.pending) { lastSave = 0; label('새 위치를 진도로 반영했습니다. 이동 전 위치는 기록에서 복구할 수 있습니다.'); }
       return current;
     }
 
     function flush(force = false) {
       const current = sample();
-      if (!active || ownerLost || !current.valid || currentId() !== active.id || current.video.seeking || restoreTarget !== null) return queue;
+      if (!active || ownerLost || !current.valid || currentId() !== active.id || current.video.seeking || seekOrigin || restoreTarget !== null) return queue;
       if (!force && now() - lastSave < 3000) return queue;
       lastSave = now();
       const owner = { ...active }, credits = pendingCredits.splice(0);
-      const snapshot = { position: current.position, duration: current.duration, completed: Boolean(current.video.ended) };
+      const snapshot = guard.snapshot(current.position, current.duration, Boolean(current.video.ended));
       return enqueue(async () => {
         if (!await store.savePosition(owner.id, owner.token, snapshot)) {
           if (active?.token === owner.token) { ownerLost = true; meter.reset(); label('다른 탭에서 재생 중입니다. 이어 듣기를 누르면 이 탭으로 전환합니다.'); }
@@ -332,18 +465,24 @@
           await store.set(key, existing ? { ...existing, endPosition: part.endPosition, listenedSeconds: existing.listenedSeconds + part.listenedSeconds, updatedAt: part.updatedAt } : part);
         }
         if (selected === owner.id) progress = { videoId: owner.id, ...snapshot, updatedAt: now() };
-        label(snapshot.completed ? '완주했습니다. 기록·영상에서 다음 영상을 골라 주세요.' : `저장됨 · ${new Date(now()).toLocaleTimeString('ko-KR', { timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit' })}`);
+        label(snapshot.pending ? `기존 진도 ${formatTime(snapshot.position)} 보호 중 · 이동 전 위치는 자동 보관됩니다.` : snapshot.completed ? '완주했습니다. 기록·영상에서 다음 영상을 골라 주세요.' : `저장됨 · ${new Date(now()).toLocaleTimeString('ko-KR', { timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit' })}`);
         render();
       });
     }
 
     function handleEvent(event) {
+      if (event.type === 'seeking') {
+        if (restoreTarget === null && !seekOrigin) seekOrigin = lastObserved || { id: boundId, position: progress.position, at: now() };
+        meter.reset(); return;
+      }
       if (event.type === 'seeking' || event.type === 'ratechange' || event.type === 'waiting') meter.reset();
       if (event.type === 'play' && restored && !active && !ownerLost) begin(boundId).catch(fail);
       if (event.type === 'playing' && restored && !active && !ownerLost) begin(boundId).catch(fail);
       if (event.type === 'seeked') {
         meter.reset();
-        if (restoreTarget !== null && Math.abs(boundVideo.currentTime - restoreTarget) <= 2) restoreTarget = null;
+        if (restoreTarget !== null && Math.abs(boundVideo.currentTime - restoreTarget) <= 2) { restoreTarget = null; seekOrigin = null; }
+        else if (seekOrigin && evidence().valid) { const from = seekOrigin; seekOrigin = null; recordJump(from, boundVideo.currentTime); }
+        lastObserved = { id: boundId, position: boundVideo.currentTime, at: now() };
       }
       if (event.type === 'pause' || event.type === 'ended' || event.type === 'seeked') flush(true).catch(fail);
       else flush().catch(fail);
@@ -359,6 +498,7 @@
         if (boundVideo) for (const type of events) boundVideo.removeEventListener(type, handleEvent);
         // Old-player samples must never be saved under a new URL ID.
         active = null; ownerLost = false; restored = false; restoreTarget = null; meter.reset(); pendingCredits = [];
+        guard.reset(); lastObserved = null; seekOrigin = null;
         boundVideo = video; boundId = id;
         if (registered) { selected = id; progress = await store.progress(id); panelOpen = true; }
         if (video) for (const type of events) video.addEventListener(type, handleEvent);
@@ -370,11 +510,12 @@
         restored = true;
         const target = Math.min(saved.position, Math.max(0, current.duration - 0.1));
         if (Math.abs(current.video.currentTime - target) > 1) { restoreTarget = target; current.video.currentTime = target; }
+        lastObserved = { id, position: target, at: now() };
         if (!current.video.paused) await begin(id);
         label(saved.completed ? '완주한 영상입니다. 위치를 바꾸거나 다음 영상을 선택하세요.' : '이어 듣기를 누르면 마지막 위치부터 재생합니다.');
       }
       if (active && !ownerLost && !await store.owns(active.id, active.token)) {
-        ownerLost = true; meter.reset(); pendingCredits = []; label('다른 탭에서 재생 중 · 이 탭의 기록은 멈췄습니다.');
+        ownerLost = true; meter.reset(); pendingCredits = []; guard.reset(); label('다른 탭에서 재생 중 · 이 탭의 기록은 멈췄습니다.');
       }
       if (ownerLost && selected === active?.id) progress = await store.progress(selected);
       if (registered && !current.valid && !$('.status').classList.contains('error')) label(current.reason);
@@ -398,6 +539,7 @@
       if (!current.valid) { label(current.reason); return; }
       if (active && !ownerLost && !current.video.paused) { current.video.pause(); return; }
       meter.reset(); pendingCredits = [];
+      guard.reset(); seekOrigin = null;
       const target = Math.min(progress.position, Math.max(0, current.duration - 0.1));
       if (Math.abs(current.video.currentTime - target) > 0.5) { restoreTarget = target; current.video.currentTime = target; }
       restored = true;
@@ -407,6 +549,8 @@
         if (!active || ownerLost) return begin(selected);
       }).catch(() => label('유튜브 영상의 ▶ 버튼을 한 번 눌러 주세요.'));
     });
+    $('#undo-seek').addEventListener('click', () => { const pending = selectedPending(); if (pending) setPosition(selected, pending.fromPosition).catch(() => {}); });
+    $('#accept-seek').addEventListener('click', () => { const pending = selectedPending(); if (pending) setPosition(selected, pending.position, 'edit').catch(() => {}); });
     $('#add').addEventListener('submit', (event) => {
       event.preventDefault();
       enqueue(async () => {
@@ -420,19 +564,9 @@
     });
     $('#edit').addEventListener('submit', (event) => {
       event.preventDefault();
-      enqueue(async () => {
-        const target = parseTime($('#time').value);
-        if (target === null) throw new Error('분:초 또는 시:분:초로 입력해 주세요.');
-        const saved = await store.progress(selected);
-        if (saved.duration && target > saved.duration) throw new Error('영상 길이보다 짧은 위치를 입력해 주세요.');
-        const current = evidence();
-        if (currentId() === selected && current.valid) current.video.pause();
-        const token = await store.claim(selected);
-        if (active?.id === selected) { active = null; ownerLost = false; meter.reset(); pendingCredits = []; restoreTarget = null; }
-        await store.savePosition(selected, token, { position: target, duration: saved.duration, completed: false });
-        if (currentId() === selected && current.valid) { restored = true; current.video.currentTime = target; }
-        progress = await store.progress(selected); label('시작 위치를 저장했습니다.'); render(); await renderDetails();
-      }).catch(() => {});
+      const target = parseTime($('#time').value);
+      if (target === null) { fail(new Error('분:초 또는 시:분:초로 입력해 주세요.')); return; }
+      setPosition(selected, target, 'edit').catch(() => {});
     });
     $('#export').addEventListener('click', () => enqueue(async () => {
       const backup = await store.exportBackup();
@@ -448,6 +582,7 @@
       try { data = JSON.parse(await file.text()); } catch { throw new Error('JSON 백업 파일을 읽을 수 없습니다.'); }
       await store.importBackup(data);
       active = null; ownerLost = false; restored = false; pendingCredits = []; meter.reset();
+      guard.reset(); seekOrigin = null; lastObserved = null;
       videos = await store.videos(); progress = await store.progress(selected);
       event.target.value = ''; label('백업을 기존 기록에 합쳤습니다.'); render(); await renderDetails();
     }).catch(() => {}));
@@ -465,7 +600,7 @@
     };
   }
 
-  const core = { parseTime, parseVideo, formatTime, seoulDate, splitListening, Meter, Store, validateBackup, inspectPlayer, startApp, PREFIX, MAX_BACKUP_BYTES };
+  const core = { parseTime, parseVideo, formatTime, seoulDate, splitListening, Meter, ResumeGuard, Store, validateBackup, inspectPlayer, startApp, PREFIX, MAX_BACKUP_BYTES, CONFIRM_SECONDS };
   if (typeof module === 'object' && module.exports) { module.exports = core; return; }
   if (typeof GM === 'undefined' || typeof GM.getValue !== 'function') return;
   startApp({ window, document, gm: GM, page: typeof unsafeWindow === 'undefined' ? window : unsafeWindow }).catch((error) => {

@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { parseTime, parseVideo, formatTime, seoulDate, splitListening, Meter, Store, validateBackup, PREFIX } = require('../drama-bible-resume.user.js');
+const { parseTime, parseVideo, formatTime, seoulDate, splitListening, Meter, ResumeGuard, Store, validateBackup, PREFIX } = require('../drama-bible-resume.user.js');
 
 function memory() {
   const values = new Map();
@@ -94,4 +94,37 @@ test('Invalid backups are fully rejected before any storage write', async () => 
   invalid.progress = []; invalid.videos.push({ ...invalid.videos[0] });
   assert.throws(() => validateBackup(invalid));
 });
-module.exports = { memory };
+test('Resume protection preserves its initial anchor across scrubs until measured listening confirms it', () => {
+  const guard = new ResumeGuard();
+  guard.seek(2400, 600, 10, 'jump-1'); guard.observe(20, 620);
+  guard.seek(620, 300, 20, 'jump-2');
+  assert.equal(guard.snapshot(300, 4200, false).position, 2400);
+  guard.observe(29, 329); assert.ok(guard.pending);
+  guard.observe(1, 330); assert.equal(guard.snapshot(330, 4200, false).position, 330);
+});
+
+test('Backup preserves recovery points and unconfirmed moves, and accepts legacy files', async () => {
+  let n = 0; const first = new Store(memory(), () => 200, () => `source-${++n}`);
+  await first.addVideo(ID, '사도행전', 90); const owner = await first.claim(ID);
+  const guard = new ResumeGuard(); guard.seek(90, 20, 200, 'jump-1');
+  await first.checkpoint(ID, 90, 20);
+  await first.savePosition(ID, owner, guard.snapshot(20, 900, false));
+  const backup = await first.exportBackup();
+  const next = new Store(memory(), () => 300, () => `target-${++n}`);
+  await next.importBackup(backup); await next.importBackup(backup);
+  assert.equal((await next.progress(ID)).pending.position, 20);
+  assert.equal((await next.entries('checkpoint:')).length, 1);
+  assert.ok((await next.recoverable(ID)).some((p) => p.position === 90));
+  const legacy = structuredClone(backup); delete legacy.checkpoints; delete legacy.progress[0].pending;
+  assert.doesNotThrow(() => validateBackup(legacy));
+  backup.progress[0].pending.fromPosition = 80;
+  const badStore = new Store(memory()); await assert.rejects(badStore.importBackup(backup));
+  assert.equal((await badStore.gm.listValues()).length, 0);
+});
+
+test('A failed recovery write keeps the original progress protected even after thirty seconds', () => {
+  const guard = new ResumeGuard(); guard.seek(90, 20, 100, 'failed-point');
+  guard.observe(30, 50, false);
+  assert.equal(guard.snapshot(50, 900, false).position, 90);
+  assert.equal(guard.pending.listenedSeconds, 30);
+});
