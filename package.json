@@ -1,6 +1,6 @@
 {
   "name": "drama-bible-resume",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Android Firefox에서 드라마바이블 이어 듣기와 개인 청취 기록",
   "scripts": {

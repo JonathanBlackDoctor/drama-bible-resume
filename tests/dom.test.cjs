@@ -36,7 +36,7 @@ test('One resume tap plays, records actual listening, and pause flushes the fina
   f.video.pause(); await f.settle();
   assert.equal((await f.app.store.progress(ID)).position, 93);
   const sessions = await f.app.store.entries('session:');
-  assert.ok(sessions[0].listenedSeconds >= 2);
+  assert.equal(sessions[0].listenedSeconds, 3);
   f.click('.secondary'); await f.settle();
   assert.match(f.app.root.querySelector('#history').textContent, /2026-01-02/);
 });

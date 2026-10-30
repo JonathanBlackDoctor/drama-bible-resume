@@ -17,6 +17,7 @@ test('YouTube links are allowlisted and tracking parameters are discarded', () =
 test('Time entry accepts seconds and clock notation, rejects malformed input', () => {
   for (const [input, value] of [['1:23', 83], ['1:02:03', 3723], ['45s', 45], ['2m', 120], ['', null], ['-1', null], ['2:99', null], ['hello', null]]) assert.equal(parseTime(input), value);
   assert.equal(formatTime(3723.99), '1:02:03');
+  assert.equal(parseTime('9'.repeat(400) + ':00'), null);
 });
 test('Listening uses elapsed playback and excludes forward/backward seeks, ads and buffering', () => {
   const meter = new Meter();

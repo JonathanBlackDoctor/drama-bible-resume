@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         드라마바이블 이어듣기
 // @namespace    https://github.com/JonathanBlackDoctor/drama-bible-resume
-// @version      1.0.0
+// @version      1.0.1
 // @description  마지막 위치부터 성경을 듣고, 날짜별 청취 기록을 내 기기에 보관합니다.
 // @author       JonathanBlackDoctor
 // @license      MIT
@@ -31,12 +31,13 @@
   const copy = (value) => JSON.parse(JSON.stringify(value));
 
   function parseTime(value) {
-    if (typeof value === 'number') return Number.isFinite(value) && value >= 0 ? value : null;
+    const checked = (n) => Number.isFinite(n) && n >= 0 && n <= 1e12 ? n : null;
+    if (typeof value === 'number') return checked(value);
     const text = String(value ?? '').trim();
-    if (/^\d+(?:\.\d+)?s?$/.test(text)) { const n = Number(text.replace(/s$/, '')); return Number.isFinite(n) && n <= 1e12 ? n : null; }
-    if (/^\d+(?::[0-5]\d){1,2}$/.test(text)) return text.split(':').reduce((n, part) => n * 60 + Number(part), 0);
+    if (/^\d+(?:\.\d+)?s?$/.test(text)) return checked(Number(text.replace(/s$/, '')));
+    if (/^\d+(?::[0-5]\d){1,2}$/.test(text)) return checked(text.split(':').reduce((n, part) => n * 60 + Number(part), 0));
     const units = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/.exec(text);
-    return units && text ? Number(units[1] || 0) * 3600 + Number(units[2] || 0) * 60 + Number(units[3] || 0) : null;
+    return units && text ? checked(Number(units[1] || 0) * 3600 + Number(units[2] || 0) * 60 + Number(units[3] || 0)) : null;
   }
 
   function parseVideo(input) {
@@ -287,6 +288,7 @@
         const token = await store.claim(id);
         if (destroyed || currentId() !== id || boundId !== id) return;
         active = { id, token }; ownerLost = false; meter.reset(); pendingCredits = []; lastSave = 0;
+        sample();
         progress = await store.progress(selected);
         label('듣는 중 · 자동 기록'); render();
       })();
