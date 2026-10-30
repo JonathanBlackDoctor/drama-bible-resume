@@ -1,6 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { parseTime, parseVideo, formatTime, seoulDate, splitListening, Meter, ResumeGuard, Store, validateBackup, PREFIX } = require('../drama-bible-resume.user.js');
+const { parseTime, parseVideo, formatTime, seoulDate, splitListening, Meter, ResumeGuard, Store, validateBackup, consumePlayTicket, validRate, PREFIX } = require('../drama-bible-resume.user.js');
 
 function memory() {
   const values = new Map();
@@ -127,4 +127,24 @@ test('A failed recovery write keeps the original progress protected even after t
   guard.observe(30, 50, false);
   assert.equal(guard.snapshot(50, 900, false).position, 90);
   assert.equal(guard.pending.listenedSeconds, 30);
+});
+
+test('Speed preferences survive backup restoration and reject invalid speeds before writes', async () => {
+  const source = new Store(memory()); await source.addVideo(ID, '사도행전'); await source.set('playbackRate', 1.75);
+  const backup = await source.exportBackup(); const target = new Store(memory());
+  await target.importBackup(backup); assert.equal(await target.get('playbackRate'), 1.75);
+  backup.settings.playbackRate = 0;
+  const invalid = new Store(memory()); await assert.rejects(invalid.importBackup(backup));
+  assert.equal((await invalid.gm.listValues()).length, 0);
+  for (const rate of [NaN, Infinity, -1, 0, 5, '1.5']) assert.equal(validRate(rate), false);
+});
+
+test('Navigation play tickets require matching video and nonce, expire, and are consumed once', () => {
+  const data = new Map();
+  const win = { sessionStorage: { getItem: (k) => data.get(k), removeItem: (k) => data.delete(k) } };
+  const write = () => data.set('dbr:play-ticket', JSON.stringify({ id: ID, nonce: 'once', at: 100 }));
+  write(); assert.equal(consumePlayTicket(win, `https://m.youtube.com/watch?v=${ID}&dbr_play=wrong`, 200), null);
+  assert.equal(consumePlayTicket(win, `https://m.youtube.com/watch?v=${ID}&dbr_play=once`, 200), ID);
+  assert.equal(consumePlayTicket(win, `https://m.youtube.com/watch?v=${ID}&dbr_play=once`, 201), null);
+  write(); assert.equal(consumePlayTicket(win, `https://m.youtube.com/watch?v=${ID}&dbr_play=once`, 30101), null);
 });

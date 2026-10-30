@@ -5,12 +5,13 @@
 <script>
   window.GM={getValue:async(k,f=null)=>{const v=localStorage.getItem(k);return v===null?f:JSON.parse(v)},setValue:async(k,v)=>localStorage.setItem(k,JSON.stringify(v)),listValues:async()=>Object.keys(localStorage).filter(k=>k.startsWith('dbr:'))};
   window.unsafeWindow=window;
-  const p=document.getElementById('movie_player'),v=p.querySelector('video'); let pos=0,paused=true;
+  const p=document.getElementById('movie_player'),v=p.querySelector('video'); let pos=0,paused=true,rate=1,cued=false;
   p.getVideoData=()=>({video_id:'jVO5lOOS37w',title:'사도행전 · 전체 통독'});
   p.getPlayerResponse=()=>({videoDetails:{videoId:'jVO5lOOS37w',lengthSeconds:'900'}});
-  Object.defineProperties(v,{duration:{get:()=>900},currentTime:{get:()=>pos,set:n=>{pos=n;queueMicrotask(()=>v.dispatchEvent(new Event('seeked')))}},paused:{get:()=>paused},ended:{get:()=>pos>=900},readyState:{get:()=>4},seeking:{get:()=>false},playbackRate:{get:()=>1}});
-  v.play=()=>{paused=false;v.dispatchEvent(new Event('play'));return Promise.resolve()};v.pause=()=>{paused=true;v.dispatchEvent(new Event('pause'))};
-  setInterval(()=>{if(!paused){pos=Math.min(900,pos+1);v.dispatchEvent(new Event(pos>=900?'ended':'timeupdate'))}document.getElementById('clock').textContent=Math.floor(pos/60)+':'+String(Math.floor(pos%60)).padStart(2,'0')},1000);
+  Object.defineProperties(v,{duration:{get:()=>900},currentTime:{get:()=>pos,set:n=>{pos=n;queueMicrotask(()=>v.dispatchEvent(new Event('seeked')))}},paused:{get:()=>paused},ended:{get:()=>pos>=900},readyState:{get:()=>4},seeking:{get:()=>false},playbackRate:{get:()=>rate,set:n=>{rate=n;queueMicrotask(()=>v.dispatchEvent(new Event('ratechange')))}}});
+  v.play=()=>{if(!cued)return Promise.reject(new DOMException('Page player initialization required','NotSupportedError'));paused=false;v.dispatchEvent(new Event('play'));return Promise.resolve()};v.pause=()=>{paused=true;v.dispatchEvent(new Event('pause'))};
+  p.playVideo=()=>{cued=true;return v.play()};p.pauseVideo=()=>v.pause();p.setPlaybackRate=n=>{if(rate!==n)v.playbackRate=n};
+  setInterval(()=>{if(!paused){pos=Math.min(900,pos+rate);v.dispatchEvent(new Event(pos>=900?'ended':'timeupdate'))}document.getElementById('clock').textContent=Math.floor(pos/60)+':'+String(Math.floor(pos%60)).padStart(2,'0')+' · '+rate+'배속 · '+(paused?'정지':'재생')},1000);
   document.getElementById('ad').onclick=()=>p.classList.toggle('ad-showing');
   document.getElementById('back').onclick=()=>{v.dispatchEvent(new Event('seeking'));v.currentTime=Math.max(0,pos-20)};
   document.getElementById('reset').onclick=()=>{for(const k of Object.keys(localStorage))if(k.startsWith('dbr:'))localStorage.removeItem(k);location.reload()};

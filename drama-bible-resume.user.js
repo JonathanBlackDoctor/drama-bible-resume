@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         드라마바이블 이어듣기
 // @namespace    https://github.com/JonathanBlackDoctor/drama-bible-resume
-// @version      1.1.0
+// @version      1.2.0
 // @description  마지막 위치부터 성경을 듣고, 날짜별 청취 기록을 내 기기에 보관합니다.
 // @author       JonathanBlackDoctor
 // @license      MIT
@@ -29,6 +29,8 @@
   const SEOUL = 9 * 3600 * 1000;
   const DAY = 24 * 3600 * 1000;
   const CONFIRM_SECONDS = 30;
+  const SPEEDS = [0.25, 0.5, 0.75, 1, 1.1, 1.2, 1.25, 1.5, 1.75, 2, 2.5, 3, 4];
+  const validRate = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0.25 && value <= 4;
   const copy = (value) => JSON.parse(JSON.stringify(value));
 
   function parseTime(value) {
@@ -150,7 +152,12 @@
       seenPoints.add(p.id);
       return { id: p.id, videoId: p.videoId, at: p.at, fromPosition: p.fromPosition, toPosition: p.toPosition, kind: p.kind };
     });
-    return { videos, progress, sessions, checkpoints };
+    let settings = null;
+    if (raw.settings !== undefined) {
+      if (!raw.settings || !validRate(raw.settings.playbackRate)) bad();
+      settings = { playbackRate: raw.settings.playbackRate };
+    }
+    return { videos, progress, sessions, checkpoints, settings };
   }
 
   class Store {
@@ -216,7 +223,9 @@
       const progress = await Promise.all(videos.map((video) => this.progress(video.id)));
       const sessions = (await this.entries('session:')).filter(Boolean);
       const checkpoints = (await this.entries('checkpoint:')).filter(Boolean);
-      return { format: 'drama-bible-resume', version: 1, exportedAt: new Date(this.now()).toISOString(), videos, progress, sessions, checkpoints };
+      const storedRate = await this.get('playbackRate', 1);
+      const settings = { playbackRate: validRate(storedRate) ? storedRate : 1 };
+      return { format: 'drama-bible-resume', version: 1, exportedAt: new Date(this.now()).toISOString(), videos, progress, sessions, checkpoints, settings };
     }
     async importBackup(raw) {
       const backup = validateBackup(raw); // Validate the entire file BEFORE the first write.
@@ -239,16 +248,74 @@
         const key = `checkpoint:${point.videoId}:${point.id}`;
         if (!await this.get(key)) await this.set(key, point);
       }
+      if (backup.settings) await this.set('playbackRate', backup.settings.playbackRate);
       return backup;
     }
+  }
+
+  function playbackTarget(doc, page) {
+    const element = doc.getElementById('movie_player') || doc.querySelector('.html5-video-player');
+    let raw;
+    try { raw = page.document.getElementById('movie_player') || page.document.querySelector('.html5-video-player'); } catch { raw = element; }
+    const player = raw?.wrappedJSObject || raw;
+    const video = element?.querySelector('video.html5-main-video') || element?.querySelector('video');
+    const button = element?.querySelector('.ytp-large-play-button, .ytp-play-button, button[aria-label^="재생"], button[aria-label^="Play"]') || doc.querySelector('.player-controls-play-pause-icon')?.closest('button');
+    return { element, player, video, button };
+  }
+
+  function applyPlaybackRate(target, rate) {
+    if (!validRate(rate)) return;
+    if (target.element?.matches('.ad-showing, .ad-interrupting')) return;
+    try { if (typeof target.player?.setPlaybackRate === 'function') target.player.setPlaybackRate(rate); } catch { /* Native media supports additional rates. */ }
+    if (target.video) {
+      try {
+        target.video.defaultPlaybackRate = rate;
+        if (Math.abs(target.video.playbackRate - rate) > 0.001) target.video.playbackRate = rate;
+      } catch { /* A replaced player will be handled on its next metadata event. */ }
+    }
+  }
+
+  // Run synchronously in the user's click before any storage await. Initialize YouTube itself,
+  // since an uncued HTML video can have no source until the page player receives playVideo().
+  function playThroughYouTube(target, rate) {
+    let apiCalled = false;
+    try {
+      if (typeof target.player?.playVideo === 'function') {
+        const result = target.player.playVideo();
+        if (result && typeof result.catch === 'function') result.catch(() => {});
+        apiCalled = true;
+      }
+      if (typeof target.player?.unMute === 'function') target.player.unMute();
+    } catch { /* Fall back to the visible page control. */ }
+    if (!apiCalled && target.button) target.button.click();
+    applyPlaybackRate(target, rate);
+    if (!target.video) return Promise.resolve();
+    target.video.muted = false;
+    if (target.video.volume === 0) target.video.volume = 1;
+    try { return Promise.resolve(target.video.play()); } catch (error) { return Promise.reject(error); }
+  }
+
+  function pauseThroughYouTube(target) {
+    try { target.player?.pauseVideo?.(); } catch { /* Fall back to the media element. */ }
+    target.video?.pause();
+  }
+
+  function consumePlayTicket(win, href, at) {
+    try {
+      const ticket = JSON.parse(win.sessionStorage.getItem('dbr:play-ticket') || 'null');
+      if (!ticket) return null;
+      const url = new URL(href);
+      if (at - ticket.at < 0 || at - ticket.at > 30000) { win.sessionStorage.removeItem('dbr:play-ticket'); return null; }
+      if (url.searchParams.get('dbr_play') !== ticket.nonce || url.searchParams.get('v') !== ticket.id) return null;
+      win.sessionStorage.removeItem('dbr:play-ticket');
+      return ticket.id;
+    } catch { return null; }
   }
 
   // A player-owned ID AND matching content duration are required. Page URL alone is unsafe.
   function inspectPlayer(doc, page, urlId) {
     try {
-      const player = page.document.getElementById('movie_player') || page.document.querySelector('.html5-video-player');
-      const element = doc.getElementById('movie_player') || doc.querySelector('.html5-video-player');
-      const video = element?.querySelector('video.html5-main-video') || element?.querySelector('video');
+      const { player, element, video } = playbackTarget(doc, page);
       if (!player || !element || !video) return { valid: false, video, reason: '유튜브 플레이어를 기다리는 중' };
       const overlay = element.querySelector('.ytp-ad-player-overlay, .ytp-ad-text:not([hidden])');
       const visibleAd = overlay && overlay.getClientRects().length > 0 && doc.defaultView.getComputedStyle(overlay).visibility !== 'hidden';
@@ -272,6 +339,7 @@
     .head{display:flex;align-items:center;gap:10px;padding:14px 17px 4px}.brand{font-size:11px;letter-spacing:.12em;font-weight:700;color:#60796c}.close{margin-left:auto;border:0;background:none;padding:0;min-height:32px;width:32px}.body{padding:0 17px 16px}h2{font-size:18px;letter-spacing:-.03em;margin:2px 0 5px}p{margin:5px 0}.muted{color:#64776d;font-size:12px}.progress{height:5px;background:#e5ecdf;border-radius:6px;margin:12px 0}.bar{height:100%;background:#57866b;border-radius:6px;width:0}.row{display:flex;gap:8px;align-items:center}.row>*{min-width:0}.primary{flex:1;background:#254f41;color:white;border-color:#254f41;font-weight:700;font-size:16px}.primary:hover{background:#193e32}.secondary{background:#f1f4e9}.status{min-height:19px;margin-top:8px;font-size:12px;color:#596f61}.status.error{color:#a13c25}.drawer{border-top:1px solid #dce5d9;padding:13px 17px;max-height:52vh;overflow-y:auto;overscroll-behavior:contain}h3{font-size:14px;margin:0 0 8px}label{display:block;font-size:12px;color:#50695c;margin:7px 0 3px}input{min-height:46px;border:1px solid #ccd8cb;border-radius:10px;width:100%;padding:10px;background:white;color:#233b36}form{margin:10px 0 16px}.video-row,.history-row{padding:10px 0;border-bottom:1px solid #e6ebdf}.video-row button{width:100%;text-align:left}.history-row strong{display:block;font-size:13px}.tools{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}.tools button{flex:1;font-size:12px}summary{cursor:pointer;padding:8px 0}.chip{position:fixed;right:12px;bottom:max(12px,env(safe-area-inset-bottom));z-index:2147483646;border-radius:30px;box-shadow:0 3px 15px #102c2933;background:#fffdf6;font-weight:700}.empty{padding:15px 0;color:#687969;font-size:13px}.small{font-size:12px}.count{color:#69816c;font-size:12px;margin-left:7px}[hidden]{display:none!important}
     .safety{background:#fff0cf;border:1px solid #e5ca8f;border-radius:12px;padding:9px;margin-top:9px;font-size:12px}.safety button{font-size:12px;flex:1}.safety p{margin:0 0 7px}.recovery-list{max-height:190px;overflow:auto;margin-bottom:16px}.recovery-list button{width:100%;text-align:left;margin:3px 0;font-size:12px}.history-row button{font-size:12px}
     .shell{max-height:calc(100dvh - 24px);display:flex;flex-direction:column}.head,.body{flex-shrink:0}.drawer{min-height:0;flex:1 1 auto}
+    .speed-row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:8px}.speed-row label{margin:0;font-size:12px}.speed-row select{font:inherit;color:#254f41;background:#fff;border:1px solid #ccd8cb;border-radius:10px;min-height:40px;min-width:100px;padding:6px 10px}.speed-row select:focus-visible{outline:3px solid #d58c37}
     @media(prefers-reduced-motion:no-preference){.bar{transition:width .3s}}@media(max-height:500px){.drawer{max-height:35vh}.shell{bottom:5px}}
   `;
 
@@ -287,6 +355,15 @@
     let selected = videos.some((v) => v.id === initial?.id) ? initial.id : await store.get('last', DEFAULT_VIDEO.id);
     if (!videos.some((v) => v.id === selected)) selected = DEFAULT_VIDEO.id;
     let progress = await store.progress(selected);
+    const savedRate = await store.get('playbackRate');
+    let rateConfigured = validRate(savedRate);
+    const initialRate = playbackTarget(doc, page).video?.playbackRate;
+    let preferredRate = rateConfigured ? savedRate : validRate(initialRate) ? initialRate : 1;
+    let rateLockUntil = 0;
+    let needsRateRestore = true;
+    const ticketId = consumePlayTicket(win, getUrl(), now());
+    let playIntent = ticketId && videos.some((v) => v.id === ticketId) ? { id: ticketId, deadline: now() + 15000, attempts: 0, lastAttempt: -Infinity } : null;
+    const navigate = env.navigate || ((url) => win.location.assign(url));
     let active = null, ownerLost = false, starting = null, queue = Promise.resolve(), destroyed = false;
     let boundVideo = null, boundId = null, restored = false, drawerOpen = false, panelOpen = Boolean(initial && videos.some((v) => v.id === initial.id));
     let lastSave = 0, lastUi = 0, status = '기록은 이 기기에만 보관됩니다.', restoreTarget = null;
@@ -299,6 +376,15 @@
     const root = host.attachShadow({ mode: 'open' });
     root.innerHTML = `<style>${CSS}</style><button class="chip" type="button">📖 성경 듣기</button><section class="shell" aria-label="드라마바이블 이어듣기"><div class="head"><span class="brand">DRAMA BIBLE · 이어듣기</span><button class="close" aria-label="패널 접기" type="button">×</button></div><div class="body"><h2 id="title"></h2><p class="muted" id="position"></p><div class="progress" role="progressbar" aria-label="영상 진도" aria-valuemin="0" aria-valuemax="100"><div class="bar"></div></div><div class="row"><button class="primary" type="button">▶ 이어 듣기</button><button class="secondary" type="button" aria-expanded="false">기록·영상</button></div><p class="status" role="status" aria-live="polite"></p></div><div class="drawer" hidden><h3>내 성경 영상</h3><div id="library"></div><form id="add"><label for="url">다른 성경 영상 추가</label><input id="url" type="url" placeholder="유튜브 영상 링크" required><label for="video-title">영상 이름 (선택)</label><input id="video-title" placeholder="예: 로마서 전체 통독" maxlength="200"><button type="submit" style="margin-top:8px;width:100%">＋ 영상 추가</button></form><details><summary>현재 위치 직접 수정</summary><form id="edit"><label for="time">시:분:초 또는 분:초</label><div class="row"><input id="time" placeholder="0:00" required><button type="submit">저장</button></div><p class="muted">선택한 영상의 다음 시작 위치를 바꿉니다.</p></form></details><div class="tools"><button id="export" type="button">백업 저장</button><button id="import" type="button">백업 가져오기</button><input id="file" type="file" accept=".json,application/json" hidden></div><p class="muted">가져오기는 기존 기록에 합칩니다. 백업에는 개인 청취 기록이 들어 있습니다.</p><h3 style="margin-top:18px">날짜별 청취 기록 <span class="count">서울 시간</span></h3><div id="history"></div><p class="muted">앞뒤로 이동한 구간은 청취 시간에 포함하지 않습니다. 백그라운드 저장은 Android 절전 설정에 따라 늦어질 수 있습니다.</p></div></section>`;
     const $ = (selector) => root.querySelector(selector);
+    const speedRow = doc.createElement('div'); speedRow.className = 'speed-row';
+    speedRow.innerHTML = '<label for="speed">재생 속도 · 다음에도 기억</label><select id="speed" aria-label="재생 속도"></select>';
+    $('.status').before(speedRow);
+    for (const rate of SPEEDS) { const option = doc.createElement('option'); option.value = String(rate); option.textContent = `${rate}배속`; $('#speed').append(option); }
+    function showRate() {
+      if (![...$('#speed').options].some((o) => Number(o.value) === preferredRate)) { const option = doc.createElement('option'); option.value = String(preferredRate); option.textContent = `${preferredRate}배속`; $('#speed').append(option); }
+      $('#speed').value = String(preferredRate);
+    }
+    showRate();
     const safety = doc.createElement('div'); safety.className = 'safety'; safety.hidden = true;
     safety.innerHTML = '<p id="safety-note"></p><div class="row"><button id="undo-seek" type="button">이동 전으로 복구</button><button id="accept-seek" type="button">새 진도로 확정</button></div>';
     $('.body').append(safety);
@@ -312,6 +398,52 @@
     const evidence = () => inspectPlayer(doc, page, currentId());
     const selectedPending = () => currentId() === selected && guard.pending ? guard.pending : progress.pending;
 
+    function rememberRate(value) {
+      if (!validRate(value)) return;
+      preferredRate = value; rateConfigured = true; showRate();
+      enqueue(() => store.set('playbackRate', preferredRate)).catch(() => {});
+    }
+
+    function finishPlayback(intent) {
+      if (playIntent !== intent || currentId() !== intent.id) return;
+      const current = evidence();
+      if (!current.valid || !restored || current.video.paused) return;
+      playIntent = null;
+      if (!active || ownerLost || active.id !== intent.id) begin(intent.id).catch(fail);
+      else label('듣는 중 · 자동 기록');
+      render();
+    }
+
+    function requestPlayback() {
+      const intent = playIntent;
+      if (!intent || currentId() !== intent.id || intent.cancelled || intent.attempts >= 6) return;
+      intent.attempts++; intent.lastAttempt = now(); rateLockUntil = now() + 3000;
+      const target = playbackTarget(doc, page);
+      // Keep the page-player call, unmute, and native play inside the trusted click's task.
+      if (!restored && !target.element?.matches('.ad-showing, .ad-interrupting')) {
+        try {
+          const identity = target.player?.getVideoData?.()?.video_id || target.player?.getPlayerResponse?.()?.videoDetails?.videoId;
+          if (identity === intent.id && typeof target.player?.seekTo === 'function') target.player.seekTo(progress.position, true);
+        } catch { /* Verified-metadata restoration remains authoritative. */ }
+      }
+      playThroughYouTube(target, preferredRate).then(() => {
+        if (intent.cancelled) { if (!playIntent) pauseThroughYouTube(playbackTarget(doc, page)); return; }
+        finishPlayback(intent);
+      }).catch((error) => {
+        if (playIntent !== intent) return;
+        intent.error = error?.name || 'PlaybackError';
+        label(error?.name === 'NotAllowedError' ? '재생 허용을 기다리는 중 · 컨트롤러를 다시 누르면 취소합니다.' : '유튜브 재생 준비 중…');
+        render();
+      });
+    }
+
+    function cancelPlayback() {
+      if (playIntent) playIntent.cancelled = true;
+      playIntent = null;
+      pauseThroughYouTube(playbackTarget(doc, page));
+      label('일시정지했습니다.'); render();
+    }
+
     function render() {
       if (destroyed) return;
       $('.chip').hidden = panelOpen; $('.shell').hidden = !panelOpen;
@@ -322,7 +454,8 @@
       $('#position').textContent = `${formatTime(position)}${duration > 0 ? ` / ${formatTime(duration)}` : '부터 이어 듣기'}${progress.completed ? ' · 완주' : ''}`;
       const percent = duration > 0 ? Math.min(100, position / duration * 100) : 0;
       $('.bar').style.width = `${percent}%`; $('.progress').setAttribute('aria-valuenow', String(Math.round(percent)));
-      $('.primary').textContent = live.valid && currentId() === selected && !live.video.paused && active && !ownerLost ? 'Ⅱ 일시정지' : '▶ 이어 듣기';
+      const media = playbackTarget(doc, page).video;
+      $('.primary').textContent = currentId() === selected && media && !media.paused ? 'Ⅱ 일시정지' : playIntent?.id === selected ? '재생 준비 중 · 취소' : '▶ 이어 듣기';
       $('.status').textContent = status;
       const pending = selectedPending();
       safety.hidden = !pending;
@@ -471,6 +604,15 @@
     }
 
     function handleEvent(event) {
+      if (event.type === 'ratechange' && evidence().valid) {
+        const actual = boundVideo?.playbackRate;
+        if (validRate(actual) && Math.abs(actual - preferredRate) > 0.001) {
+          if (rateConfigured && now() < rateLockUntil) applyPlaybackRate(playbackTarget(doc, page), preferredRate);
+          else rememberRate(actual);
+        }
+      }
+      if (event.type === 'loadedmetadata' || event.type === 'emptied') needsRateRestore = true;
+      if (event.type === 'playing' && playIntent) finishPlayback(playIntent);
       if (event.type === 'seeking') {
         if (restoreTarget === null && !seekOrigin) seekOrigin = lastObserved || { id: boundId, position: progress.position, at: now() };
         meter.reset(); return;
@@ -487,18 +629,20 @@
       if (event.type === 'pause' || event.type === 'ended' || event.type === 'seeked') flush(true).catch(fail);
       else flush().catch(fail);
     }
-    const events = ['play', 'playing', 'pause', 'ended', 'seeking', 'seeked', 'ratechange', 'waiting', 'timeupdate'];
+    const events = ['play', 'playing', 'pause', 'ended', 'seeking', 'seeked', 'ratechange', 'waiting', 'timeupdate', 'loadedmetadata', 'canplay', 'emptied'];
 
     async function reconcileOnce() {
       if (destroyed) return;
       const id = currentId(), current = evidence();
       const registered = videos.some((v) => v.id === id);
       const video = registered ? current.video : null;
+      if (playIntent && playIntent.id !== id) { playIntent.cancelled = true; playIntent = null; }
       if (boundVideo !== video || boundId !== id) {
         if (boundVideo) for (const type of events) boundVideo.removeEventListener(type, handleEvent);
         // Old-player samples must never be saved under a new URL ID.
         active = null; ownerLost = false; restored = false; restoreTarget = null; meter.reset(); pendingCredits = [];
         guard.reset(); lastObserved = null; seekOrigin = null;
+        needsRateRestore = true; rateLockUntil = now() + 3000;
         boundVideo = video; boundId = id;
         if (registered) { selected = id; progress = await store.progress(id); panelOpen = true; }
         if (video) for (const type of events) video.addEventListener(type, handleEvent);
@@ -511,6 +655,7 @@
         const target = Math.min(saved.position, Math.max(0, current.duration - 0.1));
         if (Math.abs(current.video.currentTime - target) > 1) { restoreTarget = target; current.video.currentTime = target; }
         lastObserved = { id, position: target, at: now() };
+        if (playIntent) { playIntent.deadline = now() + 15000; requestPlayback(); }
         if (!current.video.paused) await begin(id);
         label(saved.completed ? '완주한 영상입니다. 위치를 바꾸거나 다음 영상을 선택하세요.' : '이어 듣기를 누르면 마지막 위치부터 재생합니다.');
       }
@@ -518,7 +663,23 @@
         ownerLost = true; meter.reset(); pendingCredits = []; guard.reset(); label('다른 탭에서 재생 중 · 이 탭의 기록은 멈췄습니다.');
       }
       if (ownerLost && selected === active?.id) progress = await store.progress(selected);
-      if (registered && !current.valid && !$('.status').classList.contains('error')) label(current.reason);
+      if (!current.valid) needsRateRestore = true;
+      if (registered && current.valid && needsRateRestore) {
+        if (rateConfigured) { rateLockUntil = now() + 3000; applyPlaybackRate(playbackTarget(doc, page), preferredRate); }
+        else if (validRate(current.video.playbackRate)) { preferredRate = current.video.playbackRate; showRate(); }
+        needsRateRestore = false;
+      }
+      if (playIntent) {
+        const target = playbackTarget(doc, page);
+        if (current.valid && restored && target.video && !target.video.paused) finishPlayback(playIntent);
+        else if (!target.video || target.video.paused) {
+          if (now() >= playIntent.deadline) {
+            const blocked = playIntent.error === 'NotAllowedError'; playIntent.cancelled = true; playIntent = null;
+            fail(new Error(blocked ? '브라우저가 재생을 차단했습니다. 이 컨트롤러의 재생 버튼을 다시 눌러 주세요.' : '유튜브 재생 준비가 지연됐습니다. 이 컨트롤러에서 다시 재생해 주세요.'));
+          } else if (now() - playIntent.lastAttempt >= 2000) requestPlayback();
+        }
+      }
+      if (registered && !current.valid && !playIntent && !$('.status').classList.contains('error')) label(current.reason);
       await flush();
       if (now() - lastUi >= 1000) { lastUi = now(); render(); }
     }
@@ -531,23 +692,34 @@
     $('.chip').addEventListener('click', () => { panelOpen = true; render(); });
     $('.close').addEventListener('click', () => { panelOpen = false; render(); });
     $('.secondary').addEventListener('click', () => { drawerOpen = !drawerOpen; $('.drawer').hidden = !drawerOpen; $('.secondary').setAttribute('aria-expanded', String(drawerOpen)); if (drawerOpen) detailsTask = renderDetails().catch(fail); });
+    $('#speed').addEventListener('change', () => {
+      const rate = Number($('#speed').value);
+      if (!validRate(rate)) return;
+      meter.reset(); rememberRate(rate); rateLockUntil = now() + 3000;
+      applyPlaybackRate(playbackTarget(doc, page), rate);
+      label(`${rate}배속 저장 · 다음 재생에도 적용합니다.`);
+    });
     $('.primary').addEventListener('click', () => {
       const current = evidence();
       if (currentId() !== selected) {
-        win.location.assign(`https://m.youtube.com/watch?v=${selected}`); return;
+        const url = new URL('/watch', new URL(getUrl()).origin); url.searchParams.set('v', selected);
+        const nonce = uuid();
+        try { win.sessionStorage.setItem('dbr:play-ticket', JSON.stringify({ id: selected, nonce, at: now() })); url.searchParams.set('dbr_play', nonce); } catch { url.searchParams.set('autoplay', '1'); }
+        navigate(url.href); return;
       }
-      if (!current.valid) { label(current.reason); return; }
-      if (active && !ownerLost && !current.video.paused) { current.video.pause(); return; }
+      const media = playbackTarget(doc, page).video;
+      if (playIntent || (media && !media.paused)) { cancelPlayback(); return; }
       meter.reset(); pendingCredits = [];
       guard.reset(); seekOrigin = null;
-      const target = Math.min(progress.position, Math.max(0, current.duration - 0.1));
-      if (Math.abs(current.video.currentTime - target) > 0.5) { restoreTarget = target; current.video.currentTime = target; }
-      restored = true;
-      // Keep play() in the original touch handler: await would lose mobile user activation.
-      const playing = current.video.play();
-      Promise.resolve(playing).then(() => {
-        if (!active || ownerLost) return begin(selected);
-      }).catch(() => label('유튜브 영상의 ▶ 버튼을 한 번 눌러 주세요.'));
+      if (current.valid) {
+        const target = Math.min(progress.position, Math.max(0, current.duration - 0.1));
+        if (Math.abs(current.video.currentTime - target) > 0.5) { restoreTarget = target; current.video.currentTime = target; }
+        restored = true;
+      }
+      if (!rateConfigured) rememberRate(preferredRate);
+      playIntent = { id: selected, deadline: now() + 15000, attempts: 0, lastAttempt: -Infinity };
+      label('유튜브 재생 준비 중…'); render();
+      requestPlayback();
     });
     $('#undo-seek').addEventListener('click', () => { const pending = selectedPending(); if (pending) setPosition(selected, pending.fromPosition).catch(() => {}); });
     $('#accept-seek').addEventListener('click', () => { const pending = selectedPending(); if (pending) setPosition(selected, pending.position, 'edit').catch(() => {}); });
@@ -584,6 +756,8 @@
       active = null; ownerLost = false; restored = false; pendingCredits = []; meter.reset();
       guard.reset(); seekOrigin = null; lastObserved = null;
       videos = await store.videos(); progress = await store.progress(selected);
+      const restoredRate = await store.get('playbackRate');
+      if (validRate(restoredRate)) { preferredRate = restoredRate; rateConfigured = true; showRate(); needsRateRestore = true; }
       event.target.value = ''; label('백업을 기존 기록에 합쳤습니다.'); render(); await renderDetails();
     }).catch(() => {}));
 
@@ -600,7 +774,7 @@
     };
   }
 
-  const core = { parseTime, parseVideo, formatTime, seoulDate, splitListening, Meter, ResumeGuard, Store, validateBackup, inspectPlayer, startApp, PREFIX, MAX_BACKUP_BYTES, CONFIRM_SECONDS };
+  const core = { parseTime, parseVideo, formatTime, seoulDate, splitListening, Meter, ResumeGuard, Store, validateBackup, playbackTarget, applyPlaybackRate, playThroughYouTube, pauseThroughYouTube, consumePlayTicket, validRate, inspectPlayer, startApp, PREFIX, MAX_BACKUP_BYTES, CONFIRM_SECONDS };
   if (typeof module === 'object' && module.exports) { module.exports = core; return; }
   if (typeof GM === 'undefined' || typeof GM.getValue !== 'function') return;
   startApp({ window, document, gm: GM, page: typeof unsafeWindow === 'undefined' ? window : unsafeWindow }).catch((error) => {

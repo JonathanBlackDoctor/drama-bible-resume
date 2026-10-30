@@ -6,17 +6,19 @@ const ID = 'jVO5lOOS37w';
 function memory() { const data = new Map(); return { getValue: async (key, fallback = null) => data.has(key) ? structuredClone(data.get(key)) : fallback, setValue: async (key, value) => { data.set(key, structuredClone(value)); }, listValues: async () => [...data.keys()] }; }
 async function fixture(t, options = {}) {
   const duration = options.duration || 900;
-  const dom = new JSDOM('<!doctype html><html><body><div id="movie_player"><video class="html5-main-video"></video></div></body></html>', { url: `https://m.youtube.com/watch?v=${ID}&t=${options.position ?? 90}s`, pretendToBeVisual: true });
+  const dom = new JSDOM('<!doctype html><html><body><div id="movie_player"><video class="html5-main-video"></video></div></body></html>', { url: options.href || `https://m.youtube.com/watch?v=${options.id || ID}&t=${options.position ?? 90}s`, pretendToBeVisual: true });
   const win = dom.window, doc = win.document, player = doc.getElementById('movie_player');
-  let currentId = ID, clock = Date.parse('2026-01-02T01:00:00Z'), n = 0;
+  let currentId = options.id || ID, clock = Date.parse('2026-01-02T01:00:00Z'), n = 0;
   player.getVideoData = () => ({ video_id: currentId, title: '테스트 영상' });
   player.getPlayerResponse = () => ({ videoDetails: { videoId: currentId, lengthSeconds: String(duration), title: '테스트 영상' } });
   const video = player.querySelector('video');
-  for (const [key, value] of Object.entries({ duration, currentTime: 0, paused: true, ended: false, readyState: 4, seeking: false, playbackRate: 1 })) Object.defineProperty(video, key, { configurable: true, writable: true, value });
+  for (const [key, value] of Object.entries({ duration, currentTime: 0, paused: true, ended: false, readyState: options.readyState ?? 4, seeking: false, playbackRate: 1 })) Object.defineProperty(video, key, { configurable: true, writable: true, value });
   video.play = () => { video.paused = false; video.dispatchEvent(new win.Event('play')); return Promise.resolve(); };
   video.pause = () => { video.paused = true; video.dispatchEvent(new win.Event('pause')); };
   const gm = options.gm || memory();
-  const app = await startApp({ window: win, document: doc, page: win, gm, now: () => clock, uuid: () => `${options.prefix || 'tab'}-${++n}` });
+  if (options.ticket) win.sessionStorage.setItem('dbr:play-ticket', options.ticket);
+  options.setup?.({ win, doc, player, video });
+  const app = await startApp({ window: win, document: doc, page: win, gm, now: () => clock, navigate: options.navigate, uuid: () => `${options.prefix || 'tab'}-${++n}` });
   const settle = async () => { await Promise.resolve(); await app.idle(); };
   const seeked = async () => { video.dispatchEvent(new win.Event('seeked')); await settle(); };
   const tick = async (seconds = 1) => { clock += seconds * 1000; if (!video.paused) video.currentTime += seconds * video.playbackRate; await app.reconcile(); await settle(); };
@@ -93,8 +95,10 @@ test('Playback rejection is explained without falsely claiming playback started'
   const f = await fixture(t); await f.seeked();
   f.video.play = () => Promise.reject(new Error('NotAllowedError'));
   f.click('.primary'); await f.settle(); await new Promise((resolve) => setImmediate(resolve));
-  assert.match(f.app.root.querySelector('.status').textContent, /▶ 버튼/);
+  assert.match(f.app.root.querySelector('.status').textContent, /준비 중/);
   assert.equal(f.video.paused, true);
+  await f.tick(16);
+  assert.match(f.app.root.querySelector('.status').textContent, /컨트롤러에서 다시 재생/);
 });
 
 test('Hidden ad nodes do not block content, while missing player evidence fails closed', async (t) => {
@@ -210,4 +214,113 @@ test('Seeking directly to the end does not falsely complete the protected origin
   f.video.ended = true; f.video.paused = true; f.video.dispatchEvent(new f.win.Event('ended')); await f.settle();
   const saved = await f.app.store.progress(ID);
   assert.equal(saved.position, 93); assert.equal(saved.completed, false);
+});
+
+test('Controller invokes the YouTube page player synchronously even when raw media play fails', async (t) => {
+  let apiCalls = 0;
+  const f = await fixture(t, { setup: ({ player, video, win }) => {
+    player.playVideo = () => { apiCalls++; video.paused = false; video.dispatchEvent(new win.Event('playing')); };
+    video.play = () => Promise.reject(new win.DOMException('Media is managed by YouTube', 'NotSupportedError'));
+  } });
+  await f.seeked(); f.click('.primary');
+  assert.equal(apiCalls, 1, 'The click must not await GM storage before invoking the player');
+  await f.settle(); assert.equal(f.video.paused, false);
+  assert.equal(f.app.root.querySelector('.primary').textContent, 'Ⅱ 일시정지');
+  f.click('.primary'); await f.settle(); assert.equal(f.video.paused, true);
+});
+
+test('First controller tap initializes an uncued player and restores progress after metadata arrives', async (t) => {
+  let apiCalls = 0, earlySeek = null;
+  const f = await fixture(t, { readyState: 0, setup: ({ player, video, win }) => {
+    player.seekTo = (position) => { earlySeek = position; video.currentTime = position; };
+    player.playVideo = () => { apiCalls++; video.readyState = 4; video.paused = false; video.dispatchEvent(new win.Event('playing')); };
+    video.play = () => Promise.reject(new win.DOMException('Uncued', 'NotSupportedError'));
+  } });
+  assert.equal(f.video.currentTime, 0); f.click('.primary'); assert.equal(apiCalls, 1);
+  assert.equal(earlySeek, 90); await f.app.reconcile(); await f.settle();
+  assert.equal(f.video.paused, false); assert.equal(f.video.currentTime, 90);
+  assert.equal((await f.app.store.progress(ID)).position, 90);
+});
+
+test('Missing player API falls back to the native YouTube control inside the same controller click', async (t) => {
+  let clicks = 0;
+  const f = await fixture(t, { setup: ({ player, video, doc, win }) => {
+    const button = doc.createElement('button'); button.className = 'ytp-play-button'; player.append(button);
+    button.onclick = () => { clicks++; video.paused = false; video.dispatchEvent(new win.Event('playing')); };
+    video.play = () => Promise.reject(new win.DOMException('Needs page initialization', 'NotSupportedError'));
+  } });
+  await f.seeked(); f.click('.primary'); await f.settle();
+  assert.equal(clicks, 1); assert.equal(f.video.paused, false);
+});
+
+test('Controller play unmutes listening without requiring a second YouTube tap', async (t) => {
+  const f = await fixture(t); await f.seeked(); f.video.muted = true; f.video.volume = 0;
+  f.click('.primary'); await f.settle();
+  assert.equal(f.video.paused, false); assert.equal(f.video.muted, false); assert.ok(f.video.volume > 0);
+});
+
+test('Blocked play has bounded retries, reports actual state, and never creates listening credit', async (t) => {
+  let calls = 0;
+  const f = await fixture(t); await f.seeked();
+  f.video.play = () => { calls++; return Promise.reject(new f.win.DOMException('Denied', 'NotAllowedError')); };
+  f.click('.primary'); await f.settle();
+  for (let i = 0; i < 8; i++) await f.tick(2);
+  assert.ok(calls <= 6, `Unbounded play calls: ${calls}`);
+  assert.equal(f.video.paused, true); assert.equal((await f.app.store.entries('session:')).length, 0);
+  assert.match(f.app.root.querySelector('.status').textContent, /컨트롤러의 재생 버튼/);
+  const previous = calls; await f.tick(30); assert.equal(calls, previous);
+});
+
+test('Pending play can be cancelled from the controller and does not resume later', async (t) => {
+  const f = await fixture(t); await f.seeked(); let resolve;
+  f.video.play = () => new Promise((done) => { resolve = done; });
+  f.click('.primary'); assert.match(f.app.root.querySelector('.primary').textContent, /취소/);
+  f.click('.primary'); resolve(); await f.settle(); await f.tick(16);
+  assert.equal(f.video.paused, true);
+  assert.equal(f.app.root.querySelector('.primary').textContent, '▶ 이어 듣기');
+});
+
+test('Speed selected before play persists across reload and is applied on the next controller tap', async (t) => {
+  const f = await fixture(t); await f.seeked();
+  f.app.root.querySelector('#speed').value = '1.5';
+  f.app.root.querySelector('#speed').dispatchEvent(new f.win.Event('change')); await f.settle();
+  assert.equal(await f.app.store.get('playbackRate'), 1.5);
+  f.app.destroy();
+  const next = await fixture(t, { gm: f.gm, prefix: 'rate-reload' }); await next.seeked();
+  assert.equal(next.app.root.querySelector('#speed').value, '1.5');
+  next.click('.primary'); await next.settle();
+  assert.equal(next.video.playbackRate, 1.5); assert.equal(next.video.paused, false);
+  await next.tick(4); next.video.pause(); await next.settle();
+  const sessions = await next.app.store.entries('session:');
+  assert.equal(sessions[0].listenedSeconds, 4, '1.5x media time must not inflate real listening time');
+});
+
+test('Configured speed is reapplied after YouTube metadata resets the media element', async (t) => {
+  const f = await fixture(t); await f.seeked();
+  f.app.root.querySelector('#speed').value = '1.75';
+  f.app.root.querySelector('#speed').dispatchEvent(new f.win.Event('change')); await f.settle();
+  f.video.playbackRate = 1; f.video.dispatchEvent(new f.win.Event('loadedmetadata'));
+  await f.app.reconcile(); assert.equal(f.video.playbackRate, 1.75);
+});
+
+test('A native YouTube speed adjustment is remembered after initialization', async (t) => {
+  const f = await fixture(t); await f.seeked(); await f.tick(4);
+  f.video.playbackRate = 1.25; f.video.dispatchEvent(new f.win.Event('ratechange')); await f.settle();
+  assert.equal(await f.app.store.get('playbackRate'), 1.25);
+  assert.equal(f.app.root.querySelector('#speed').value, '1.25');
+});
+
+test('Controller carries a single-use play request when opening another registered video', async (t) => {
+  let destination;
+  const f = await fixture(t, { navigate: (url) => { destination = url; } });
+  f.click('.secondary'); await f.settle();
+  f.app.root.querySelector('#url').value = 'https://youtu.be/T1Z4eTqGmVQ?t=45s';
+  f.app.root.querySelector('#add').dispatchEvent(new f.win.Event('submit', { bubbles: true, cancelable: true })); await f.settle();
+  f.click('.primary');
+  assert.equal(new URL(destination).searchParams.get('v'), 'T1Z4eTqGmVQ');
+  assert.ok(new URL(destination).searchParams.get('dbr_play'));
+  const ticket = f.win.sessionStorage.getItem('dbr:play-ticket');
+  const next = await fixture(t, { id: 'T1Z4eTqGmVQ', href: destination, gm: f.gm, ticket, prefix: 'navigated' }); await next.settle();
+  assert.equal(next.video.currentTime, 45); assert.equal(next.video.paused, false);
+  assert.equal(next.win.sessionStorage.getItem('dbr:play-ticket'), null);
 });
